@@ -1,0 +1,177 @@
+# ESPHome firmware for ESP-8266
+esphome:
+  name: hrv-controller
+  friendly_name: hrv_controller
+
+esp8266:
+  # board: esp01_1m
+  board: d1_mini
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "<your HASS encryption key>"
+
+ota:
+  - platform: esphome
+    password: "your OTA password"
+
+wifi:
+  # Wifi creds are set up via ESPHome secrets
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Hrv-Controller Fallback Hotspot"
+    password: "<fallback hotspot password>"
+
+captive_portal:
+   
+# I2C board 
+i2c:
+  sda: GPIO4
+  scl: GPIO5
+  scan: True
+  frequency: 100kHz
+
+mcp4728:
+  - id: dac_output
+
+substitutions:
+  vref_volts: "5.00"
+
+
+
+output:
+  # Wire - Green
+  # Remote - G
+  - platform: mcp4728
+    id: hrv_g
+    channel: A
+    vref: vdd
+    power_down: normal
+
+  # Wire - Black
+  # Remote - W
+  - platform: mcp4728
+    id: hrv_w
+    channel: D
+    vref: vdd
+    power_down: normal
+
+globals:
+  - id: vref_f
+    type: float
+    initial_value: ${vref_volts}
+
+text_sensor:
+  - platform: homeassistant
+    id: ha_hrv_mode
+    entity_id: input_select.hrv_mode
+    on_value:
+      then:
+        - component.update: tft_display
+
+binary_sensor:
+  - platform: homeassistant
+    id: ha_auto_mode
+    entity_id: switch.hrv_auto_mode
+    on_state:
+      then:
+        - component.update: tft_display
+
+font:
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: bold
+    id: roboto_bold
+    size: 22
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: regular
+    id: roboto_reg
+    size: 16
+
+spi:
+  clk_pin: GPIO14
+  mosi_pin: GPIO13
+
+display:
+  - platform: st7735
+    id: tft_display
+    model: "INITR_BLACKTAB"
+    invert_colors: false
+    reset_pin: GPIO2
+    cs_pin: GPIO16
+    dc_pin: GPIO15
+    rotation: 0
+    device_width: 128
+    device_height: 128
+    col_start: 2
+    row_start: 1
+    eight_bit_color: true
+    update_interval: 10s
+
+    lambda: |-
+      it.fill(Color::BLACK);
+      const char* mode =
+        id(ha_hrv_mode).has_state() ? id(ha_hrv_mode).state.c_str() : "—";
+      it.printf(it.get_width()/2, it.get_height()/2 - 16, id(roboto_reg), Color::WHITE,
+                TextAlign::CENTER, "Mode:");
+      it.printf(it.get_width()/2, it.get_height()/2 + 16, id(roboto_bold), Color::WHITE,
+                TextAlign::CENTER, mode);
+
+script:
+  - id: set_hrv_volts
+    mode: restart
+    parameters:
+      v_g: float
+      v_w: float
+    then:
+      - lambda: |-
+          auto clamp01 = [](float x){ return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); };
+          const float vref = id(vref_f);
+          id(hrv_g).set_level( clamp01( v_g / vref ) );
+          id(hrv_w).set_level( clamp01( v_w / vref ) );
+          ESP_LOGI("hrv_control", "Applied: G=%.2f V, W=%.2f V (Vref=%.3f V)", v_g, v_w, vref);
+
+interval:
+  - interval: 5s
+    then:
+      - if:
+          condition:
+            api.connected
+          then:
+            - lambda: |-
+                float g = 1.4f;
+                float w = 2.0f;
+                std::string source = "fallback (Off)";
+
+                if (id(ha_hrv_mode).has_state()) {
+                  const std::string mode = id(ha_hrv_mode).state;
+                  source = "HA: " + mode;
+                  if      (mode == "Econo")        { g = 3.4f; w = 3.1f; }
+                  else if (mode == "Vent")         { g = 3.4f; w = 2.0f; }
+                  else if (mode == "Intermittent") { g = 4.4f; w = 2.0f; }
+                  else if (mode == "Off")          { g = 1.4f; w = 2.0f; }
+                  else { source = "HA: unknown '" + mode + "', default Off"; }
+                } else {
+                  source = "No HA state - fallback Off";
+                }
+
+                ESP_LOGI("hrv_control",
+                        "Mode: %s | Target G=%.2f V | W=%.2f V",
+                        source.c_str(), g, w);
+
+                // Use the helper script to apply voltages
+                id(set_hrv_volts).execute(g, w);
+          else:
+            - logger.log:
+                level: INFO
+                format: "Waiting for Home Assistant API..."
